@@ -1,0 +1,320 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score, classification_report,
+    confusion_matrix, roc_curve, roc_auc_score
+)
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from imblearn.over_sampling import SMOTE
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+------------------------------------------------------------------------------------------------
+
+df = pd.read_csv("/content/data_1.csv")
+
+# Binary label
+y = df["attack"].astype(int)
+----------------------------------------------------------------------------------------------
+
+for col in X.select_dtypes(include=["object"]).columns:
+    le = LabelEncoder()
+    X[col] = le.fit_transform(X[col].astype(str))
+---------------------------------------------------------------------------------------------------
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+---------------------------------------------------------------------------------------------------
+
+X_train = X_train.replace([np.inf, -np.inf], np.nan)
+X_test  = X_test.replace([np.inf, -np.inf], np.nan)
+
+imputer = SimpleImputer(strategy="median")
+X_train = imputer.fit_transform(X_train)
+X_test  = imputer.transform(X_test)
+drop(columns=["attack", "category", "subcategory"], errors="ignore")
+-------------------------------------------------------------------------------------------------------
+
+X_train, y_train = SMOTE(random_state=42).fit_resample(X_train, y_train)
+
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test  = scaler.transform(X_test)
+----------------------------------------------------------------------------------------------------------
+
+# Ensure labels are numpy arrays
+y_clients = [y.values for y in y_clients]
+
+MAX_SAMPLES_PER_CLIENT = 30000
+
+X_clients_fast = []
+y_clients_fast = []
+
+for i in range(NUM_CLIENTS):
+    n = len(X_clients[i])
+    idx = np.random.choice(
+        n,
+        size=min(MAX_SAMPLES_PER_CLIENT, n),
+        replace=False
+    )
+
+    X_clients_fast.append(X_clients[i][idx])
+    y_clients_fast.append(y_clients[i][idx])
+-------------------------------------------------------------------------------------------------------------
+
+def create_fast_model(input_dim):
+    model = tf.keras.Sequential([
+        tf.keras.layers.Dense(32, activation="relu", input_shape=(input_dim,)),
+        tf.keras.layers.Dense(1, activation="sigmoid")
+    ])
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss="binary_crossentropy",
+        metrics=["accuracy"]
+    )
+    return model
+---------------------------------------------------------------------------------------------------------------
+
+ROUNDS = 3
+EPOCHS = 1
+BATCH_SIZE = 1024
+
+global_model = create_fast_model(X_train.shape[1])
+
+for r in range(ROUNDS):
+    print(f"Round {r+1}/{ROUNDS}")
+    client_weights = []
+
+    for i in range(NUM_CLIENTS):
+        local_model = create_fast_model(X_train.shape[1])
+        local_model.set_weights(global_model.get_weights())
+
+        local_model.fit(
+            X_clients_fast[i],
+            y_clients_fast[i],
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            verbose=0
+        )
+
+        client_weights.append(local_model.get_weights())
+
+    new_weights = [
+        np.mean([w[layer] for w in client_weights], axis=0)
+        for layer in range(len(client_weights[0]))
+    ]
+
+    global_model.set_weights(new_weights)
+------------------------------------------------------------------------------------------------------------------
+
+fedavg_probs = global_model.predict(X_test).ravel()
+fedavg_preds = (fedavg_probs > 0.5).astype(int)
+
+print("FedAvg Accuracy:", accuracy_score(y_test, fedavg_preds))
+print("Attacks Detected:", fedavg_preds.sum())
+--------------------------------------------------------------------------------------------------------------------
+
+rf_models = []
+
+for i in range(NUM_CLIENTS):
+    if len(np.unique(y_clients[i])) < 2:
+        continue
+
+    rf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=20,
+        n_jobs=-1,
+        random_state=42
+    )
+    rf.fit(X_clients[i], y_clients[i])
+    rf_models.append(rf)
+
+
+def federated_rf_probs(models, X):
+    return np.mean([m.predict_proba(X)[:,1] for m in models], axis=0)
+
+rf_probs = federated_rf_probs(rf_models, X_test)
+rf_preds = (rf_probs > 0.5).astype(int)
+---------------------------------------------------------------------------------------------------------------
+
+gb_models = []
+
+for i in range(NUM_CLIENTS):
+    if len(np.unique(y_clients[i])) < 2:
+        continue
+
+    gb = GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=3,
+        random_state=42
+    )
+    gb.fit(X_clients[i], y_clients[i])
+    gb_models.append(gb)
+
+def federated_gb_probs(models, X):
+    return np.mean([m.predict_proba(X)[:,1] for m in models], axis=0)
+---------------------------------------------------------------------------------------------------------------------
+
+rf_probs = federated_rf_probs(rf_models, X_test)
+gb_probs = federated_gb_probs(gb_models, X_test)
+
+ensemble_probs = (rf_probs + gb_probs) / 2
+ensemble_pred = (ensemble_probs > 0.5).astype(int)
+-------------------------------------------------------------------------------------------------------------
+
+# Subsample training data (very important)
+X_fast, _, y_fast, _ = train_test_split(
+    X_train, y_train,
+    train_size=0.35,
+    stratify=y_train,
+    random_state=42
+)
+--------------------------------------------------------------------------------------------------------------
+
+from sklearn.ensemble import RandomForestClassifier
+
+rf_central = RandomForestClassifier(
+    n_estimators=120,        # ↓ from 200
+    max_depth=18,            # ↓ from 25
+    min_samples_split=10,
+    min_samples_leaf=5,
+    max_features="sqrt",
+    n_jobs=-1,
+    random_state=42
+)
+
+rf_central.fit(X_fast, y_fast)
+------------------------------------------------------------------------------------------------------------------
+
+from sklearn.ensemble import GradientBoostingClassifier
+
+gb_central = GradientBoostingClassifier(
+    n_estimators=120,        # ↓ from 250
+    learning_rate=0.1,       # ↑ faster convergence
+    max_depth=3,
+    subsample=0.8,           # stochastic GB (huge speedup)
+    random_state=42
+)
+
+gb_central.fit(X_fast, y_fast)
+------------------------------------------------------------------------------------------------------------------------------
+
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix, matthews_corrcoef
+)
+
+def evaluate_model(y_true, y_pred, y_prob=None):
+    metrics = {}
+
+    metrics["Accuracy"] = accuracy_score(y_true, y_pred)
+    metrics["Precision"] = precision_score(y_true, y_pred, zero_division=0)
+    metrics["Recall"] = recall_score(y_true, y_pred, zero_division=0)
+    metrics["F1-Score"] = f1_score(y_true, y_pred, zero_division=0)
+    metrics["MCC"] = matthews_corrcoef(y_true, y_pred)
+
+    # Confusion Matrix (force binary shape)
+    cm = confusion_matrix(y_true, y_pred, labels=[0,1])
+    tn, fp, fn, tp = cm.ravel()
+
+    metrics["TP"] = tp
+    metrics["TN"] = tn
+    metrics["FP"] = fp
+    metrics["FN"] = fn
+
+    metrics["Attack_Detected"] = tp
+    metrics["Normal_Correct"] = tn
+    metrics["Detection_Rate (%)"] = (tp / (tp + fn + 1e-9)) * 100
+    metrics["False_Alarm_Rate (%)"] = (fp / (fp + tn + 1e-9)) * 100
+
+    if y_prob is not None and len(np.unique(y_true)) > 1:
+        metrics["ROC-AUC"] = roc_auc_score(y_true, y_prob)
+    else:
+        metrics["ROC-AUC"] = np.nan
+
+    return metrics, cm
+-----------------------------------------------------------------------------------------------------------------------
+
+def federated_rf_probs(models, X):
+    probs = np.zeros(len(X))
+    for m in models:
+        probs += m.predict_proba(X)[:, 1]
+    return probs / len(models)
+
+
+def federated_gb_probs(models, X):
+    probs = np.zeros(len(X))
+    for m in models:
+        probs += m.predict_proba(X)[:, 1]
+    return probs / len(models)
+--------------------------------------------------------------------------------------------------------------------------------
+
+# Get probabilities
+rf_probs = federated_rf_probs(rf_models, X_test)
+gb_probs = federated_gb_probs(gb_models, X_test)
+
+# Soft Voting Ensemble
+ensemble_probs = (rf_probs + gb_probs) / 2
+
+# Final predictions
+y_pred_ensemble = (ensemble_probs > 0.5).astype(int)
+
+# Accuracy
+from sklearn.metrics import accuracy_score
+print("Federated Ensemble Accuracy:", accuracy_score(y_test, y_pred_ensemble))
+--------------------------------------------------------------------------------------------------------------------------------
+
+total_attacks = np.sum(y_test == 1)
+detected_attacks = np.sum((y_test == 1) & (y_pred_ensemble == 1))
+
+print("Total Attacks in Test Set:", total_attacks)
+print("Attacks Detected:", detected_attacks)
+print("Missed Attacks:", total_attacks - detected_attacks)
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+metrics, cm = evaluate_model(y_test, y_pred_ensemble, ensemble_probs)
+
+for k, v in metrics.items():
+    print(f"{k:25s}: {v}")
+--------------------------------------------------------------------------------------------------------------------------------------------
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(5,4))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=["Normal", "Attack"],
+            yticklabels=["Normal", "Attack"])
+
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion Matrix – Federated Ensemble")
+plt.show()
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+from sklearn.metrics import roc_curve, auc
+
+fpr, tpr, _ = roc_curve(y_test, ensemble_probs)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(6,5))
+plt.plot(fpr, tpr, label=f"Federated Ensemble (AUC = {roc_auc:.4f})")
+plt.plot([0,1], [0,1], "k--")
+
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve – Federated Ensemble IDS")
+plt.legend()
+plt.grid(True)
+plt.show()
+-------------------------------------------------------------------------------------------------------------------------
