@@ -1,0 +1,363 @@
+# Load Dataset
+
+import pandas as pd
+import glob
+
+log_files = glob.glob(
+    "/content/opt/Malware-Project/BigDataset/IoTScenarios/**/bro/conn.log.labeled",
+    recursive=True
+)
+
+print("Files found:", len(log_files))
+
+def get_zeek_columns(file):
+    with open(file) as f:
+        for line in f:
+            if line.startswith("#fields"):
+                return line.strip().split()[1:]
+    return None
+
+dfs = []
+
+for f in log_files[:5]:   # ⚡ LIMIT FILES (FAST)
+    cols = get_zeek_columns(f)
+    if cols is None:
+        continue
+
+    df_temp = pd.read_csv(
+        f,
+        sep="\t",
+        comment="#",
+        names=cols,
+        nrows=50_000,      # ⚡ LIMIT ROWS
+        engine="c"
+    )
+    dfs.append(df_temp)
+
+df = pd.concat(dfs, ignore_index=True)
+print("Dataset shape:", df.shape)
+------------------------------------------------------------------------------------------------------------------------------------
+# LABEL GENERATION (IDS RULE-BASED)
+
+def assign_label(row):
+    if row.get('id.resp_h') == '176.32.33.17':
+        return 1
+    if row.get('id.resp_p') in [37215, 666, 52869, 8081]:
+        return 1
+    if row.get('conn_state') == 'S0':
+        return 1
+    return 0
+
+df['label'] = df.apply(assign_label, axis=1)
+print(df['label'].value_counts())
+-------------------------------------------------------------------------------------------------------------------------------------------
+# FEATURE SELECTION
+
+features = [
+    'duration',
+    'orig_bytes',
+    'resp_bytes',
+    'orig_pkts',
+    'resp_pkts',
+    'proto',
+    'conn_state'
+]
+
+df = df[features + ['label']]
+df.dropna(inplace=True)
+---------------------------------------------------------------------------------------------------------------------
+# DATA CLEANING + FEATURE EXTRACTION
+
+import numpy as np
+
+num_cols = ['duration','orig_bytes','resp_bytes','orig_pkts','resp_pkts']
+
+df[num_cols] = df[num_cols].replace('-', np.nan)
+
+for col in num_cols:
+    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+df[num_cols] = df[num_cols].fillna(df[num_cols].median())
+----------------------------------------------------------------------------------------------------------------------
+# ENCODING + SCALING
+
+df = pd.get_dummies(df, columns=['proto', 'conn_state'])
+
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+df[num_cols] = scaler.fit_transform(df[num_cols])
+-------------------------------------------------------------------------------------------------------------------------
+# TRAIN–TEST SPLIT
+
+from sklearn.model_selection import train_test_split
+
+X = df.drop('label', axis=1)
+y = df['label']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+----------------------------------------------------------------------------------------------------------------------------
+# SMOTE (CLASS BALANCING)
+
+from imblearn.over_sampling import SMOTE
+
+smote = SMOTE(random_state=42)
+X_train, y_train = smote.fit_resample(X_train, y_train)
+
+print("After SMOTE:", y_train.value_counts())
+
+------------------------------------------------------------------------------------------------------------------------------------------
+# FEDERATED DATA PARTITIONING
+
+from sklearn.model_selection import StratifiedKFold
+
+NUM_CLIENTS = 5
+skf = StratifiedKFold(n_splits=NUM_CLIENTS, shuffle=True, random_state=42)
+
+X_clients, y_clients = [], []
+
+for _, idx in skf.split(X_train, y_train):
+    X_clients.append(X_train.iloc[idx])
+    y_clients.append(y_train.iloc[idx])
+------------------------------------------------------------------------------------------------------------------------------------------
+# FedAvg
+
+import numpy as np
+
+def fedavg(models):
+    avg_weights = []
+    for weights in zip(*[m.get_weights() for m in models]):
+        avg_weights.append(np.mean(weights, axis=0))
+    return avg_weights
+--------------------------------------------------------------------------------------------------------------------------------------------
+# Federated Random Forest
+
+rf_models = []
+
+for model in local_models:
+    rf_models.append(model.named_estimators_['rf'])
+from sklearn.metrics import accuracy_score
+
+def federated_rf_predict(rf_models, X):
+    probs = np.zeros((len(X), 2))
+    for rf in rf_models:
+        probs += rf.predict_proba(X)
+    probs /= len(rf_models)
+    return np.argmax(probs, axis=1)
+
+y_pred_fed_rf = federated_rf_predict(rf_models, X_test)
+
+print("Federated Random Forest Accuracy:",
+      accuracy_score(y_test, y_pred_fed_rf))
+-----------------------------------------------------------------------------------------------------------------------------------------------
+# Federated Gradient Boosting
+
+from sklearn.ensemble import GradientBoostingClassifier
+
+gb_models = []
+
+for i in range(NUM_CLIENTS):
+    gb = GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        random_state=42
+    )
+    gb.fit(X_clients[i], y_clients[i])
+    gb_models.append(gb)
+---------------------------------------------------------------------------------------------------------------------------------------------------
+# Federation Aggregation
+
+def federated_gb_predict(models, X):
+    probs = np.zeros((len(X), 2))
+    for m in models:
+        probs += m.predict_proba(X)
+    return np.argmax(probs / len(models), axis=1)
+
+y_pred_gb = federated_gb_predict(gb_models, X_test)
+print("Federated GB Accuracy:", accuracy_score(y_test, y_pred_gb))
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+# Federated Training
+
+local_models = []
+
+for i in range(NUM_CLIENTS):
+    model = build_ensemble()
+    model.fit(X_clients[i], y_clients[i]) #model training
+    local_models.append(model) #ouput
+
+print("Federated clients trained:", len(local_models))
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ENSEMBLE MODEL (CLIENT SIDE)
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+
+def build_ensemble(): #model created
+    rf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=25,
+        n_jobs=-1,
+        random_state=42
+    )
+    gb = GradientBoostingClassifier(
+        n_estimators=150,
+        learning_rate=0.05,
+        random_state=42
+    )
+    return VotingClassifier(
+        estimators=[('rf', rf), ('gb', gb)],
+        voting='soft'
+    )
+-------------------------------------------------------------------------------------------------------------------------------------------------------------
+# FEDERATED ENSEMBLE AGGREGATION
+
+import numpy as np
+from sklearn.metrics import accuracy_score, classification_report
+
+def federated_predict(models, X):
+    probs = np.zeros((len(X), 2))
+    for m in models:
+        probs += m.predict_proba(X)
+    probs /= len(models)
+    return np.argmax(probs, axis=1)
+
+y_pred = federated_predict(local_models, X_test)#output
+
+print("Accuracy:", accuracy_score(y_test, y_pred))
+print(classification_report(y_test, y_pred))
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+# Performance Metrics
+
+import numpy as np
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    matthews_corrcoef
+)
+
+# Federated prediction
+def federated_predict(models, X):
+    probs = np.zeros((len(X), 2))
+    for m in models:
+        probs += m.predict_proba(X)
+    probs /= len(models)
+    return np.argmax(probs, axis=1), probs[:, 1]
+
+y_pred, y_prob = federated_predict(local_models, X_test)
+
+# Basic metrics
+acc = accuracy_score(y_test, y_pred)
+print("Accuracy:", acc)
+print("\nClassification Report:\n", classification_report(y_test, y_pred))
+
+# Confusion Matrix
+cm = confusion_matrix(y_test, y_pred)
+tn, fp, fn, tp = cm.ravel()
+
+# Advanced metrics
+fpr = fp / (fp + tn)
+fnr = fn / (fn + tp)
+roc_auc = roc_auc_score(y_test, y_prob)
+mcc = matthews_corrcoef(y_test, y_pred)
+
+# Print metrics
+print("\nConfusion Matrix:")
+print(cm)
+
+print("\nPerformance Metrics:")
+print(f"True Positives (TP): {tp}")
+print(f"True Negatives (TN): {tn}")
+print(f"False Positives (FP): {fp}")
+print(f"False Negatives (FN): {fn}")
+
+print(f"False Positive Rate (FPR): {fpr:.6f}")
+print(f"False Negative Rate (FNR): {fnr:.6f}")
+print(f"ROC-AUC Score: {roc_auc:.6f}")
+print(f"Matthews Correlation Coefficient (MCC): {mcc:.6f}")
+-----------------------------------------------------------------------------------------------------------------------------------------------
+# Count detected attacks (True Positives)
+
+import numpy as np
+
+# Convert to numpy arrays (safe)
+y_true = np.array(y_test)
+y_pred = np.array(y_pred)
+
+# True Positives: attack correctly detected
+TP = np.sum((y_true == 1) & (y_pred == 1))
+
+# Total actual attacks
+TOTAL_ATTACKS = np.sum(y_true == 1)
+
+# Attacks missed
+FN = np.sum((y_true == 1) & (y_pred == 0))
+
+print("Total Attacks in Test Data:", TOTAL_ATTACKS)
+print("Detected Attacks (True Positives):", TP)
+print("Missed Attacks (False Negatives):", FN)
+----------------------------------------------------------------------------------------------------------------------------------------------
+# Count normal traffic correctly identified
+
+TN = np.sum((y_true == 0) & (y_pred == 0))
+FP = np.sum((y_true == 0) & (y_pred == 1))
+
+print("Normal Traffic Correctly Identified (TN):", TN)
+print("False Alarms (FP):", FP)
+-----------------------------------------------------------------------------------------------------------------------------------------------
+# Percentage of attacks detected (Detection Rate)
+
+detection_rate = TP / TOTAL_ATTACKS * 100
+print(f"Attack Detection Rate: {detection_rate:.4f}%")
+-------------------------------------------------------------------------------------------------------------------------------------------------
+# Confusion Matrix Visualization
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+
+cm = confusion_matrix(y_test, y_pred)
+
+plt.figure(figsize=(6,5))
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt='d',
+    cmap='Blues',
+    xticklabels=['Normal', 'Attack'],
+    yticklabels=['Normal', 'Attack']
+)
+
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.title('Confusion Matrix – Federated Ensemble IDS')
+plt.show()
+---------------------------------------------------------------------------------------------------------------------------------------------------
+# ROC Curve Plot
+
+from sklearn.metrics import roc_curve, auc
+
+# Get averaged probabilities from federated models
+def federated_predict_proba(models, X):
+    probs = np.zeros((len(X), 2))
+    for m in models:
+        probs += m.predict_proba(X)
+    return probs / len(models)
+
+y_probs = federated_predict_proba(local_models, X_test)[:, 1]
+
+fpr, tpr, _ = roc_curve(y_test, y_probs)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(6,5))
+plt.plot(fpr, tpr, label=f'ROC Curve (AUC = {roc_auc:.6f})')
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve – Federated Ensemble IDS')
+plt.legend(loc='lower right')
+plt.grid()
+plt.show()
+---------------------------------------------------------------------------------------------------------------------------------------
