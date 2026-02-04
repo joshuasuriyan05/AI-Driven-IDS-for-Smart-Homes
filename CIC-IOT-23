@@ -1,0 +1,543 @@
+import pandas as pd
+import glob
+
+log_files = glob.glob(
+    "/content/opt/Malware-Project/BigDataset/IoTScenarios/**/bro/conn.log.labeled",
+    recursive=True
+)
+
+def get_zeek_columns(file):
+    with open(file, 'r') as f:
+        for line in f:
+            if line.startswith("#fields"):
+                return line.strip().split()[1:]
+    return None
+
+dfs = []
+
+for f in log_files[:3]:  # limit for Colab
+    cols = get_zeek_columns(f)
+    if cols is None:
+        continue
+
+    temp = pd.read_csv(
+        f,
+        sep="\t",
+        comment="#",
+        names=cols,
+        nrows=50000,
+        low_memory=True
+    )
+    dfs.append(temp)
+
+# 🔹 THIS CREATES df
+df = pd.concat(dfs, ignore_index=True)
+
+print("Dataset shape:", df.shape)
+-----------------------------------------------------------------------------------
+
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+num_cols = ['duration','orig_bytes','resp_bytes','orig_pkts','resp_pkts']
+
+# Replace Zeek missing values
+df[num_cols] = df[num_cols].replace('-', np.nan)
+
+# Convert to numeric
+df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
+
+# Fill missing values
+df[num_cols] = df[num_cols].fillna(df[num_cols].median())
+
+# Encode categorical columns safely
+cat_cols = []
+for col in ['proto', 'conn_state']:
+    if col in df.columns:
+        cat_cols.append(col)
+
+if cat_cols:
+    df = pd.get_dummies(df, columns=cat_cols)
+
+# Scale numeric features
+scaler = StandardScaler()
+df[num_cols] = scaler.fit_transform(df[num_cols])
+------------------------------------------------------------------------------------
+
+print("NaN values in label:", df['label'].isna().sum())
+print(df['label'].value_counts(dropna=False))
+df = df.dropna(subset=['label'])
+df['label'] = df['label'].fillna(0)
+print(df['label'].isna().sum())
+print(df['label'].value_counts())
+-------------------------------------------------------------------------------------
+
+def assign_label(row):
+    # Attack indicators
+    if row.get('conn_state_S0', 0) == 1:
+        return 1
+    if row.get('conn_state_REJ', 0) == 1:
+        return 1
+    if row.get('conn_state_RSTO', 0) == 1:
+        return 1
+
+    # Otherwise benign
+    return 0
+-------------------------------------------------------------------------------------
+
+df['label'] = df.apply(assign_label, axis=1)
+-------------------------------------------------------------------------------------
+
+print(df['label'].value_counts())
+print("NaN values:", df['label'].isna().sum())
+--------------------------------------------------------------------------------------
+
+from sklearn.model_selection import train_test_split
+
+X = df.drop('label', axis=1)
+y = df['label']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    stratify=y,
+    random_state=42
+)
+--------------------------------------------------------------------------------------
+
+NUM_CLIENTS = 5
+skf = StratifiedKFold(n_splits=NUM_CLIENTS, shuffle=True, random_state=42)
+
+X_clients, y_clients = [], []
+
+for _, idx in skf.split(X_train, y_train):
+    X_clients.append(X_train.iloc[idx])
+    y_clients.append(y_train.iloc[idx])
+
+print("Federated clients:", len(X_clients))
+-----------------------------------------------------------------------------------------
+
+features = [
+    'duration',
+    'orig_bytes',
+    'resp_bytes',
+    'orig_pkts',
+    'resp_pkts',
+    'proto_icmp',
+    'proto_tcp',
+    'proto_udp',
+    'conn_state_OTH',
+    'conn_state_REJ',
+    'conn_state_RSTO',
+    'conn_state_RSTR',
+    'conn_state_RSTRH',
+    'conn_state_S0',
+    'conn_state_S1',
+    'conn_state_S3',
+    'conn_state_SF',
+    'conn_state_SH',
+    'conn_state_SHR'
+]
+
+df = df[features + ['label']]
+---------------------------------------------------------------------------------------
+
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+num_cols = [
+    'duration',
+    'orig_bytes',
+    'resp_bytes',
+    'orig_pkts',
+    'resp_pkts'
+]
+
+# Replace Zeek missing values
+df[num_cols] = df[num_cols].replace('-', np.nan)
+df[num_cols] = df[num_cols].apply(pd.to_numeric, errors='coerce')
+df[num_cols] = df[num_cols].fillna(df[num_cols].median())
+
+scaler = StandardScaler()
+df[num_cols] = scaler.fit_transform(df[num_cols])
+------------------------------------------------------------------------------------------
+
+df['label'] = df['label'].astype(int)
+print(df['label'].value_counts())
+--------------------------------------------------------------------------------------------
+
+from sklearn.model_selection import train_test_split
+
+X = df.drop('label', axis=1)
+y = df['label']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+---------------------------------------------------------------------------------------------
+
+print(X_train.dtypes)
+------------------------------------------------------------------------------------------------
+
+# Keep only numeric columns
+X = df.drop('label', axis=1)
+X = X.select_dtypes(include=['int64', 'float64'])
+
+y = df['label']
+
+print("Final feature shape:", X.shape)
+---------------------------------------------------------------------------------------------
+
+from sklearn.model_selection import train_test_split
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    stratify=y,
+    random_state=42
+)
+-----------------------------------------------------------------------------------------------------
+
+from sklearn.model_selection import StratifiedKFold
+
+NUM_CLIENTS = 5
+skf = StratifiedKFold(n_splits=NUM_CLIENTS, shuffle=True, random_state=42)
+
+X_clients, y_clients = [], []
+
+for _, idx in skf.split(X_train, y_train):
+    X_clients.append(X_train.iloc[idx].values)  # convert to numpy
+    y_clients.append(y_train.iloc[idx].values)
+
+print("Federated clients created:", len(X_clients))
+---------------------------------------------------------------------------------------------------
+
+import tensorflow as tf
+import numpy as np
+from sklearn.metrics import accuracy_score
+
+def create_model(input_dim):
+    model = tf.keras.Sequential([
+        tf.keras.Input(shape=(input_dim,)),
+        tf.keras.layers.Dense(64, activation='relu'),
+        tf.keras.layers.Dense(32, activation='relu'),
+        tf.keras.layers.Dense(1, activation='sigmoid')
+    ])
+    model.compile(
+        optimizer='adam',
+        loss='binary_crossentropy',
+        metrics=['accuracy']
+    )
+    return model
+
+global_model = create_model(X_train.shape[1])
+
+ROUNDS = 5
+
+for r in range(ROUNDS):
+    print(f"Federated Round {r+1}")
+    client_weights = []
+
+    for i in range(NUM_CLIENTS):
+        local_model = create_model(X_train.shape[1])
+        local_model.set_weights(global_model.get_weights())
+
+        local_model.fit(
+            X_clients[i], y_clients[i],
+            epochs=3,
+            batch_size=256,
+            verbose=0
+        )
+
+        client_weights.append(local_model.get_weights())
+
+    # FedAvg aggregation
+    new_weights = []
+    for weights in zip(*client_weights):
+        new_weights.append(np.mean(weights, axis=0))
+
+    global_model.set_weights(new_weights)
+
+# Evaluation
+y_prob = global_model.predict(X_test).ravel()
+y_pred_fedavg = (y_prob > 0.5).astype(int)
+
+print("FedAvg Accuracy:", accuracy_score(y_test, y_pred_fedavg))
+------------------------------------------------------------------------------------------
+
+import numpy as np
+
+def federated_rf_predict(models, X):
+    probs = np.zeros(len(X))
+
+    for m in models:
+        proba = m.predict_proba(X)
+
+        # If model trained with BOTH classes
+        if proba.shape[1] == 2:
+            probs += proba[:, 1]
+        else:
+            # Model trained with only ONE class
+            # If that class is attack (1), add full confidence
+            if m.classes_[0] == 1:
+                probs += np.ones(len(X))
+            else:
+                probs += np.zeros(len(X))
+
+    probs /= len(models)
+    return (probs > 0.5).astype(int)
+-----------------------------------------------------------------------------------------------
+
+from sklearn.ensemble import RandomForestClassifier
+
+rf_models = []
+
+for i in range(NUM_CLIENTS):
+    rf = RandomForestClassifier(
+        n_estimators=200,
+        max_depth=25,
+        n_jobs=-1,
+        random_state=42
+    )
+
+    rf.fit(X_clients[i], y_clients[i])
+    rf_models.append(rf)
+
+print("Federated RF models trained:", len(rf_models))
+---------------------------------------------------------------------------------------
+
+import numpy as np
+
+def federated_rf_predict(models, X):
+    probs = np.zeros(len(X))
+    for m in models:
+        probs += m.predict_proba(X)[:, 1]   # probability of attack
+    probs /= len(models)
+    return (probs > 0.5).astype(int)
+-----------------------------------------------------------------------------------------------
+from sklearn.metrics import accuracy_score, classification_report
+
+y_pred_rf = federated_rf_predict(rf_models, X_test)
+
+print("Federated RF Accuracy:", accuracy_score(y_test, y_pred_rf))
+print(classification_report(y_test, y_pred_rf))
+---------------------------------------------------------------------------------------------------
+
+import numpy as np
+from sklearn.ensemble import GradientBoostingClassifier
+
+gb_models = []
+
+for i in range(NUM_CLIENTS):
+
+    # ✅ Check class diversity correctly
+    if np.unique(y_clients[i]).shape[0] < 2:
+        print(f"Client {i} skipped (single-class data)")
+        continue
+
+    gb = GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=3,
+        random_state=42
+    )
+
+    gb.fit(X_clients[i], y_clients[i])
+    gb_models.append(gb)
+
+print("Federated GB models trained:", len(gb_models))
+----------------------------------------------------------------------------------------------
+
+def federated_gb_predict(models, X):
+    probs = np.zeros(len(X))
+
+    for m in models:
+        probs += m.predict_proba(X)[:, 1]
+
+    probs /= len(models)
+    return (probs > 0.5).astype(int)
+y_pred_gb = federated_gb_predict(gb_models, X_test)
+
+from sklearn.metrics import accuracy_score, classification_report
+print("Federated GB Accuracy:", accuracy_score(y_test, y_pred_gb))
+print(classification_report(y_test, y_pred_gb))
+--------------------------------------------------------------------------------------------------
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+
+rf = RandomForestClassifier(
+    n_estimators=300,
+    max_depth=30,
+    n_jobs=-1,
+    random_state=42
+)
+
+rf.fit(X_train, y_train)
+
+y_pred_rf = rf.predict(X_test)
+
+print("Random Forest Accuracy:", accuracy_score(y_test, y_pred_rf))
+print(classification_report(y_test, y_pred_rf))
+-----------------------------------------------------------------------------------------------------
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+
+from sklearn.metrics import (
+    accuracy_score, classification_report, confusion_matrix,
+    roc_auc_score, matthews_corrcoef
+)
+--------------------------------------------------------------------------------------------------------
+
+X = df.drop('label', axis=1)
+y = df['label']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    stratify=y,
+    random_state=42
+)
+----------------------------------------------------------------------------------------------------------
+
+scaler = StandardScaler()
+
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled  = scaler.transform(X_test)
+-------------------------------------------------------------------------------------------------------------
+
+rf = RandomForestClassifier(
+    n_estimators=300,
+    max_depth=30,
+    n_jobs=-1,
+    random_state=42
+)
+
+rf.fit(X_train_scaled, y_train)
+
+y_pred_rf  = rf.predict(X_test_scaled)
+y_prob_rf  = rf.predict_proba(X_test_scaled)[:, 1]
+
+print("Random Forest Accuracy:", accuracy_score(y_test, y_pred_rf))
+print(classification_report(y_test, y_pred_rf))
+---------------------------------------------------------------------------------------------------------------
+
+gb = GradientBoostingClassifier(
+    n_estimators=200,
+    learning_rate=0.05,
+    max_depth=3,
+    random_state=42
+)
+
+gb.fit(X_train_scaled, y_train)
+
+y_pred_gb = gb.predict(X_test_scaled)
+y_prob_gb = gb.predict_proba(X_test_scaled)[:, 1]
+
+print("Gradient Boosting Accuracy:", accuracy_score(y_test, y_pred_gb))
+print(classification_report(y_test, y_pred_gb))
+---------------------------------------------------------------------------------------------------------
+
+voting = VotingClassifier(
+    estimators=[
+        ('rf', rf),
+        ('gb', gb)
+    ],
+    voting='soft'   # ✅ Soft Voting
+)
+
+voting.fit(X_train_scaled, y_train)
+
+y_pred_vote = voting.predict(X_test_scaled)
+y_prob_vote = voting.predict_proba(X_test_scaled)[:, 1]
+
+print("Soft Voting Accuracy:", accuracy_score(y_test, y_pred_vote))
+print(classification_report(y_test, y_pred_vote))
+------------------------------------------------------------------------------------------------------------
+
+cm = confusion_matrix(y_test, y_pred_vote)
+tn, fp, fn, tp = cm.ravel()
+
+accuracy = accuracy_score(y_test, y_pred_vote)
+roc_auc = roc_auc_score(y_test, y_prob_vote)
+mcc = matthews_corrcoef(y_test, y_pred_vote)
+
+fpr = fp / (fp + tn)
+fnr = fn / (fn + tp)
+
+print("Confusion Matrix:\n", cm)
+print("Accuracy :", accuracy)
+print("ROC-AUC  :", roc_auc)
+print("MCC      :", mcc)
+print("FPR      :", fpr)
+print("FNR      :", fnr)
+------------------------------------------------------------------------------------------------------------------
+
+plt.figure(figsize=(5,4))
+plt.imshow(cm, cmap='Blues')
+plt.title("Federated Ensemble – Confusion Matrix")
+plt.colorbar()
+
+plt.xticks([0,1], ['Benign','Attack'])
+plt.yticks([0,1], ['Benign','Attack'])
+
+for i in range(2):
+    for j in range(2):
+        plt.text(j, i, cm[i, j], ha='center', va='center', color='black')
+
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+---------------------------------------------------------------------------------------------------------------------
+
+from sklearn.metrics import roc_curve, auc
+import matplotlib.pyplot as plt
+
+# Get positive class probabilities
+rf_probs_pos = rf_probs[:,1] if rf_probs.ndim==2 else rf_probs
+gb_probs_pos = gb_probs[:,1] if gb_probs.ndim==2 else gb_probs
+ensemble_probs_pos = ensemble_probs[:,1] if ensemble_probs.ndim==2 else ensemble_probs
+
+# Compute ROC
+fpr_rf, tpr_rf, _ = roc_curve(y_test, rf_probs_pos)
+fpr_gb, tpr_gb, _ = roc_curve(y_test, gb_probs_pos)
+fpr_ens, tpr_ens, _ = roc_curve(y_test, ensemble_probs_pos)
+
+# Plot
+plt.figure(figsize=(8,6))
+plt.plot(fpr_rf, tpr_rf, label=f'RF (AUC={auc(fpr_rf,tpr_rf):.2f})', color='blue')
+plt.plot(fpr_gb, tpr_gb, label=f'GB (AUC={auc(fpr_gb,tpr_gb):.2f})', color='green')
+plt.plot(fpr_ens, tpr_ens, label=f'Ensemble (AUC={auc(fpr_ens,tpr_ens):.2f})', color='red')
+plt.plot([0,1],[0,1],'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('ROC Curve')
+plt.legend()
+plt.grid(True)
+plt.show()
+---------------------------------------------------------------------------------------------------------------------------
+
+from sklearn.metrics import confusion_matrix
+
+y_pred = (ensemble_probs >= 0.5).astype(int)
+
+cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
+tn, fp, fn, tp = cm.ravel()
+
+print("Total attacks in test set:", (y_test == 1).sum())
+print("Attacks detected (TP):", tp)
+print("Attacks missed (FN):", fn)
+print("Normal traffic correct (TN):", tn)
+print("False alarms (FP):", fp)
+
+detection_rate = tp / (tp + fn)
+print("Detection Rate:", round(detection_rate * 100, 2), "%")
+-----------------------------------------------------------------------------------------------------------------------------
+
